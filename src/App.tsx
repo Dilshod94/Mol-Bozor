@@ -206,6 +206,13 @@ export default function App() {
   const [aiResult, setAiResult] = useState<{ breed: string; price: string; info: string } | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  // ATTACH_STREAM_FIX
+  useEffect(() => {
+    if (isCameraOpen && cameraStream && videoRef.current) {
+      videoRef.current.srcObject = cameraStream;
+      videoRef.current.play().catch(() => {});
+    }
+  }, [isCameraOpen, cameraStream]);
 
   // Chat State
   const [chats, setChats] = useState<Chat[]>([]);
@@ -669,7 +676,7 @@ export default function App() {
       setIsCameraOpen(true);
       setAiResult(null);
     } catch (err) {
-      setErrorMsg("Camera access denied");
+      setErrorMsg("Camera error: " + ((err as any)?.name || "unknown") + " " + ((err as any)?.message || ""));
     }
   };
 
@@ -773,6 +780,7 @@ export default function App() {
 
     recognition.onerror = (event: any) => {
       console.error("Speech recognition error:", event.error);
+      setErrorMsg("Microphone error: " + event.error);
       setVoiceStatus('idle');
     };
 

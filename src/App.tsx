@@ -206,6 +206,7 @@ export default function App() {
   const [aiResult, setAiResult] = useState<{ breed: string; price: string; info: string } | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const voiceRecorderRef = useRef<MediaRecorder | null>(null); // VOICE_RECORDER_FIX
   // ATTACH_STREAM_FIX
   useEffect(() => {
     if (isCameraOpen && cameraStream && videoRef.current) {
@@ -723,9 +724,61 @@ export default function App() {
     }
   };
 
-  const startVoiceAssistant = () => {
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
+  const blobToWavBase64 = async (blob: Blob): Promise<string> => {
+    const AC = (window as any).AudioContext || (window as any).webkitAudioContext;
+    const ctx = new AC();
+    const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+    if (ctx.close) ctx.close();
+    const len = decoded.length;
+    const mono = new Float32Array(len);
+    for (let c = 0; c < decoded.numberOfChannels; c++) {
+      const d = decoded.getChannelData(c);
+      for (let i = 0; i < len; i++) mono[i] += d[i] / decoded.numberOfChannels;
+    }
+    const targetRate = 16000;
+    const ratio = decoded.sampleRate / targetRate;
+    const outLen = Math.floor(len / ratio);
+    const pcm = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const src = i * ratio;
+      const i0 = Math.floor(src);
+      const i1 = Math.min(i0 + 1, len - 1);
+      const f = src - i0;
+      const v = mono[i0] * (1 - f) + mono[i1] * f;
+      pcm[i] = Math.max(-1, Math.min(1, v)) * 0x7fff;
+    }
+    const buffer = new ArrayBuffer(44 + pcm.length * 2);
+    const view = new DataView(buffer);
+    const writeStr = (o: number, str: string) => { for (let i = 0; i < str.length; i++) view.setUint8(o + i, str.charCodeAt(i)); };
+    writeStr(0, 'RIFF'); view.setUint32(4, 36 + pcm.length * 2, true); writeStr(8, 'WAVE');
+    writeStr(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, targetRate, true); view.setUint32(28, targetRate * 2, true);
+    view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    writeStr(36, 'data'); view.setUint32(40, pcm.length * 2, true);
+    for (let i = 0; i < pcm.length; i++) view.setInt16(44 + i * 2, pcm[i], true);
+    const bytes = new Uint8Array(buffer);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(bin);
+  };
+
+  const startVoiceAssistant = async () => {
+    // Tap again while listening -> stop and send
+    if (voiceRecorderRef.current && voiceRecorderRef.current.state === 'recording') {
+      voiceRecorderRef.current.stop();
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      setErrorMsg('Voice recording is not supported in this browser');
+      return;
+    }
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (err: any) {
+      setErrorMsg('Microphone error: ' + (err?.name || 'unknown') + ' ' + (err?.message || ''));
       return;
     }
 
@@ -734,22 +787,36 @@ export default function App() {
     setVoiceText('');
     setVoiceResponse('');
 
-    const recognition = new SpeechRecognition();
-    recognition.lang = lang === 'ru' ? 'ru-RU' : lang === 'uz' ? 'uz-UZ' : 'tg-TJ';
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 1;
+    const chunks: Blob[] = [];
+    const recorder = new MediaRecorder(stream);
+    voiceRecorderRef.current = recorder;
+    const autoStop = setTimeout(() => {
+      if (recorder.state === 'recording') recorder.stop();
+    }, 8000);
 
-    recognition.onresult = async (event: any) => {
-      const transcript = event.results[0][0].transcript;
-      setVoiceText(transcript);
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+
+    recorder.onstop = async () => {
+      clearTimeout(autoStop);
+      stream.getTracks().forEach((track) => track.stop());
+      voiceRecorderRef.current = null;
+      const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+      if (blob.size < 1000) {
+        setVoiceStatus('idle');
+        setIsVoiceActive(false);
+        return;
+      }
       setVoiceStatus('processing');
-      
       try {
+        const audio = await blobToWavBase64(blob);
         const response = await fetch('/api/gemini/voice-assistant', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            transcript,
+            audio,
+            mimeType: 'audio/wav',
             lang,
             listings: listings.slice(0, 10).map(l => ({
               title: l.title,
@@ -766,6 +833,7 @@ export default function App() {
         }
 
         const data = await response.json();
+        if (data.transcript) setVoiceText(data.transcript);
         const textResponse = data.text || "Sorry, I couldn't process that.";
         setVoiceResponse(textResponse);
         setVoiceStatus('speaking');
@@ -778,19 +846,7 @@ export default function App() {
       }
     };
 
-    recognition.onerror = (event: any) => {
-      console.error("Speech recognition error:", event.error);
-      setErrorMsg("Microphone error: " + event.error);
-      setVoiceStatus('idle');
-    };
-
-    recognition.onend = () => {
-      if (voiceStatus === 'listening') {
-        // setVoiceStatus('idle');
-      }
-    };
-
-    recognition.start();
+    recorder.start();
   };
 
   const speak = async (text: string) => {

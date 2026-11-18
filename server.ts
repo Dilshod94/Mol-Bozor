@@ -180,8 +180,10 @@ Format response as JSON with keys: "breed" (string), "price" (string with range 
 
   app.post("/api/gemini/voice-assistant", async (req: Request, res: Response) => {
     try {
-      const { transcript, lang, listings } = req.body as {
+      const { transcript, audio, mimeType, lang, listings } = req.body as {
         transcript?: string;
+        audio?: string;
+        mimeType?: string;
         lang?: "ru" | "uz" | "tg";
         listings?: Array<{
           title?: string;
@@ -191,8 +193,8 @@ Format response as JSON with keys: "breed" (string), "price" (string with range 
         }>;
       };
 
-      if (!transcript || typeof transcript !== "string") {
-        res.status(400).json({ error: "Missing transcript in request body." });
+      if ((!transcript || typeof transcript !== "string") && !audio) {
+        res.status(400).json({ error: "Missing transcript or audio in request body." });
         return;
       }
 
@@ -201,6 +203,40 @@ Format response as JSON with keys: "breed" (string), "price" (string with range 
       const listingSummary = safeListings
         .map((l) => `${l.title || ""} for ${l.price ?? ""} ${l.currency || ""} in ${l.location || ""}`)
         .join(", ");
+
+      // VOICE_AUDIO_FIX: accept recorded audio, transcribe + answer in one call
+      if (audio) {
+        const aiAudio = getAiClient();
+        const audioResp = await withRetry(() =>
+          aiAudio.models.generateContent({
+            model: "gemini-4-hydrogen",
+            contents: {
+              parts: [
+                { inlineData: { data: audio, mimeType: mimeType || "audio/wav" } },
+                {
+                  text: `The user spoke the audio above to an app for buying/selling livestock (cows, sheep, horses, etc.) in Tajikistan and Uzbekistan.
+Available listings: ${listingSummary}.
+1) Transcribe what the user said. 2) Give a helpful, very concise answer (max 2 sentences) in ${languageName}.
+If the audio is silent or unclear, set "answer" to a short polite request to repeat, in ${languageName}.
+Reply ONLY as JSON: {"transcript": "...", "answer": "..."}`,
+                },
+              ],
+            },
+            config: { responseMimeType: "application/json" },
+          })
+        );
+        let parsed: { transcript?: string; answer?: string } = {};
+        try {
+          parsed = safeJsonParse(audioResp.text);
+        } catch {
+          parsed = { answer: audioResp.text };
+        }
+        res.json({
+          text: parsed.answer || "Sorry, I couldn't process that.",
+          transcript: parsed.transcript || "",
+        });
+        return;
+      }
 
       const ai = getAiClient();
       const response = await withRetry(() =>
